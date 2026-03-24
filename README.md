@@ -4,3 +4,5 @@ SMPC-Enhanced ALADIN for Privacy Preserving Distributed OPF
 
 ALADIN is new, fast and accurate algorithm for distributed optimal problem.
 SMPC is a tool can improve the security of calculation.
+
+Env is discribed in this paper.
