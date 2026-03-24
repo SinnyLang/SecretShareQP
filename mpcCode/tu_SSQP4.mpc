@@ -1,0 +1,430 @@
+import scipy
+import numpy as np
+
+from Compiler import library
+from Compiler.compilerLib import Compiler
+from Compiler.library import for_range, print_ln, for_range_opt, if_, for_range_parallel, for_range_multithread, if_e, \
+    else_
+from Compiler.types import Array, sfix, Matrix, cint
+
+usage = "usage: %prog [options] [args]"
+compiler = Compiler(usage=usage)
+compiler.parser.add_option("--n1", dest="n1")
+compiler.parser.add_option("--n2", dest="n2")
+compiler.parser.add_option("--n3", dest="n3")
+compiler.parse_args()
+if not compiler.options.n1:
+    compiler.parser.error("--n1: HH of loc1 required")
+if not compiler.options.n2:
+    compiler.parser.error("--n2 HH of loc1 required")
+if not compiler.options.n3:
+    compiler.parser.error("--n3 HH of loc1 required")
+
+@compiler.register_function('ssQP')
+def main():
+    # 当前参与方编号：
+    n1 = int(compiler.options.n1)
+    n2 = int(compiler.options.n2)
+    n3 = int(compiler.options.n3)
+
+    # 定义每个参与方输入的维度
+    # P0: H1(20×20), A1(16×20), J1(12×20), g1(20×1)
+    # P1: H2(16×16), A2(16×16), J2(10×16), g2(16×1)
+    # P2: H3(16×16), A3(16×16), J3(8×16), g3(16×1)
+    # 所有方共享 mu(16×16), λ(16×1), rhs(16×1)
+
+    # ==================== 数据准备阶段 ====================
+    sfix.set_precision(f=40, k=80)
+    sfix.round_nearest = True  # 定点计算的最近舍入而不是概率
+
+    # print_ln('======test===')
+    # A = sfix.Matrix(200, 200)
+    # for i in range(200):
+    #     for j in range(200):
+    #         A[i][j] = sfix(i)
+    #
+    # library.start_timer(9999)
+    # C = A[2][:] * A[3][:]
+    # library.stop_timer(9999)
+    #
+    # print_ln('A is\n%s', A.reveal())
+    # print_ln('C is\n%s', C.reveal())
+    #
+    # CC = sfix.Matrix(200, 200)
+    #
+    # library.start_timer(8888)
+    # @for_range_parallel(20, 200)
+    # def _(i):
+    #     CC[i][0] = A[2][i] * A[3][i]
+    # library.stop_timer(8888)
+    # print_ln('CC is\n%s', CC.reveal())
+    #
+    # # CCC = sfix.Matrix(200, 200)
+    #
+    # A1 = A.get_column(0)
+    # A2 = A[2][:]
+    #
+    # library.start_timer(7777)
+    # CCC = A[3][:].dot(A[2][:])
+    # library.stop_timer(7777)
+    # print_ln('CCC is\n%s', CCC.reveal())
+    # print_ln('======test end=====')
+
+    # 各方私有数据维度配置
+    n_x, n_y, n_z = 20, 16, 16  # 状态变量维度
+    m_A = 16  # 共享约束维度
+    m_Jx, m_Jy, m_Jz = n1, n2, n3  # 各自私有约束维度
+
+    row = column = n_x + n_y + n_z + m_A + m_A + m_Jx + m_Jy + m_Jz
+    print(f"In tu_SSQP3.mpc QP_A is {row}x{column}, [n1,n2,n3] is [{n1, n2, n3}]")
+
+    # 输入Q1矩阵
+    sec_QP_A = Matrix(row, column, sfix)
+    sec_QP_A.assign_all(0)
+
+    sec_QP_A_recording = cint.Matrix(row, column)
+    sec_QP_A_recording.assign_all(0)
+
+    for i in range(n_x):
+        for j in range(n_x):
+            sec_QP_A[i][j] = sfix().get_input_from(0)
+            sec_QP_A_recording[i][j] = cint(1)
+    offset = n_x
+    for i in range(n_y):
+        for j in range(n_y):
+            sec_QP_A[i+offset][j+offset] = sfix().get_input_from(1)
+            sec_QP_A_recording[i+offset][j+offset] = cint(1)
+    offset += n_y
+    for i in range(n_z):
+        for j in range(n_z):
+            sec_QP_A[i+offset][j+offset] = sfix().get_input_from(2)
+            sec_QP_A_recording[i + offset][j + offset] = cint(1)
+    offset += n_z
+    for i in range(m_A):
+        for j in range(m_A):
+            sec_QP_A[i+offset][j+offset] = sfix().get_input_from(0)
+            sec_QP_A_recording[i + offset][j + offset] = cint(1)
+
+
+    offset_r = offset+m_A
+    offset_c = 0
+    for i in range(m_A):
+        for j in range(n_x):
+            s = sfix().get_input_from(0)
+            sec_QP_A[i + offset_r][j + offset_c] = s
+            sec_QP_A[j + offset_c][i + offset_r] = s
+            sec_QP_A_recording[i + offset_r][j + offset_c] = cint(1)
+            sec_QP_A_recording[j + offset_c][i + offset_r] = cint(1)
+    offset_c += n_x
+    for i in range(m_A):
+        for j in range(n_y):
+            s = sfix().get_input_from(1)
+            sec_QP_A[i + offset_r][j + offset_c] = s
+            sec_QP_A[j + offset_c][i + offset_r] = s
+            sec_QP_A_recording[i + offset_r][j + offset_c] = cint(1)
+            sec_QP_A_recording[j + offset_c][i + offset_r] = cint(1)
+    offset_c += n_y
+    for i in range(m_A):
+        for j in range(n_z):
+            s = sfix().get_input_from(2)
+            sec_QP_A[i + offset_r][j + offset_c] = s
+            sec_QP_A[j + offset_c][i + offset_r] = s
+            sec_QP_A_recording[i + offset_r][j + offset_c] = cint(1)
+            sec_QP_A_recording[j + offset_c][i + offset_r] = cint(1)
+    offset_c += n_z
+    for i in range(m_A):
+        sec_QP_A[i + offset_r][i + offset_c] = sfix(-1)
+        sec_QP_A[i + offset_c][i + offset_r] = sfix(-1)
+        sec_QP_A_recording[i + offset_r][i + offset_c] = cint(1)
+        sec_QP_A_recording[i + offset_c][i + offset_r] = cint(1)
+
+    offset_r += m_A
+    offset_c = 0
+    for i in range(m_Jx):
+        for j in range(n_x):
+            s = sfix().get_input_from(0)
+            sec_QP_A[i + offset_r][j + offset_c] = s
+            sec_QP_A[j + offset_c][i + offset_r] = s
+            sec_QP_A_recording[i + offset_r][j + offset_c] = cint(1)
+            sec_QP_A_recording[j + offset_c][i + offset_r] = cint(1)
+    offset_r += m_Jx
+    offset_c += n_x
+    for i in range(m_Jy):
+        for j in range(n_y):
+            s = sfix().get_input_from(1)
+            sec_QP_A[i + offset_r][j + offset_c] = s
+            sec_QP_A[j + offset_c][i + offset_r] = s
+            sec_QP_A_recording[i + offset_r][j + offset_c] = cint(1)
+            sec_QP_A_recording[j + offset_c][i + offset_r] = cint(1)
+    offset_r += m_Jy
+    offset_c += n_y
+    for i in range(m_Jz):
+        for j in range(n_z):
+            s = sfix().get_input_from(2)
+            sec_QP_A[i + offset_r][j + offset_c] = s
+            sec_QP_A[j + offset_c][i + offset_r] = s
+            sec_QP_A_recording[i + offset_r][j + offset_c] = cint(1)
+            sec_QP_A_recording[j + offset_c][i + offset_r] = cint(1)
+
+    # 构建 Q2
+    # b向量[g1, g2, g3, lambda , rhs, 0, 0, 0]
+    row = n_x+n_y+n_z+m_A + m_A+m_Jx+m_Jy+m_Jz
+    sec_QP_b = Matrix(row, 1, sfix)
+    offset = 0
+    for i in range(n_x):
+        sec_QP_b[i+offset][0] = sfix().get_input_from(0)
+    offset += n_x
+    for i in range(n_y):
+        sec_QP_b[i+offset][0] = sfix().get_input_from(1)
+    offset += n_y
+    for i in range(n_z):
+        sec_QP_b[i+offset][0] = sfix().get_input_from(2)
+    offset += n_z
+    for i in range(m_A):
+        sec_QP_b[i+offset][0] = sfix().get_input_from(0)
+    offset += m_A
+    for i in range(m_A):
+        sec_QP_b[i+offset][0] = sfix().get_input_from(0)
+    offset += m_A
+    for i in range(m_Jx+m_Jy+m_Jz):
+        sec_QP_b[i+offset][0] = sfix(0)
+
+    print_ln('==== sec_QP_A:\n%s\n', sec_QP_A.reveal())
+    print_ln('==== sec_QP_b:\n%s\n', sec_QP_b.reveal())
+
+    def read_A_b_P_from_mat(file_path2: str):
+        """从mat读取矩阵"""
+        # 加载 MATLAB 数据
+        data2 = scipy.io.loadmat(file_path2)
+        P2 = data2['P2']
+        return P2
+
+    P = read_A_b_P_from_mat(
+        'Player-Data/data_P.mat'
+    )
+    clear_P = cint.Matrix(P.shape[0], P.shape[1])
+    for i in range(P.shape[0]):
+        for j in range(P.shape[1]):
+            clear_P[i][j] = cint(int(P[i,j]))
+
+    print_ln('==== clear_P: %s\n', clear_P)
+
+    #=================== 定义置换以减少乘法 ==========
+
+    def permutation(P, sec_A, isFrontMuilt=True):
+        """
+        P: 置换矩阵
+        sec_A: 需要置换的秘密矩阵
+        isFrontMuilt: 是否是前乘法
+        return: isFrontMuilt ? (P @ sec_A) : (sec_A @ P)
+        """
+        row = P.shape[0]
+        column = P.shape[1]
+        res = Matrix(sec_A.shape[0], sec_A.shape[1], sec_A.value_type)
+
+        if isFrontMuilt:
+            @library.for_range_multithread(1, 1, row)
+            # @for_range_opt(row)
+            def f1(i):
+                for j in range(column):
+                    @if_(P[i][j] == 1)
+                    def ff1():
+                        res[i][:] = sec_A[j][:]
+        else:
+            @library.for_range_multithread(1, 1, column)
+            # @for_range_opt(column)
+            def f2(j):
+                for i in range(row):
+                    @if_(P[i][j] == 1)
+                    def ff2():
+                        res.set_column(j, sec_A.get_column(i))
+        return res
+
+    def permutation4CintNumpy(P, matrix, isFrontMuilt=True):
+        """
+        P: np.array 置换矩阵
+        matrix: 需要置换的numpy矩阵
+        isFrontMuilt: 是否是前乘法
+        return: isFrontMuilt ? (P @ sec_A) : (sec_A @ P)
+        """
+        row = P.shape[0]
+        column = P.shape[1]
+        res = np.zeros(matrix.shape, dtype=bool)
+        if isFrontMuilt:
+            for i in range(row):
+                for j in range(column):
+                    if P[i, j] == 1:
+                        np.copyto(res[i, :], matrix[j, :])
+        else:
+            for j in range(column):
+                for i in range(row):
+                    if P[i, j] == 1:
+                        np.copyto(res[:, j], matrix[:, i])
+        return res
+
+    #=================== 计算 ======================
+
+    sec_A_hat = permutation(clear_P, sec_QP_A, True)  # clear_P.dot(sec_QP_A)
+    sec_A_hat = permutation(clear_P.transpose(), sec_A_hat, False)  # sec_A_hat.dot(clear_P.transpose())
+    # permutation recording matrix
+    sec_QP_A_recording_hat = permutation(clear_P, sec_QP_A_recording, True)
+    sec_QP_A_recording_hat = permutation(clear_P.transpose(), sec_QP_A_recording_hat, False)
+
+    print_ln('==== sec_A_hat:\n%s\n', sec_A_hat.reveal())
+    print_ln('==== sec_A_recording_hat:\n%s\n', sec_QP_A_recording_hat.reveal())
+
+    Multi_table = Matrix(sec_A_hat.shape[0], sec_A_hat.shape[1], sfix)
+    Multi_table.assign_all(0)
+
+
+    def ldl_compose(a):
+        n = a.shape[0]
+
+        L = Matrix(n, n, sfix)
+        D = Array(n, sfix)
+        s1= Array(n, sfix)
+        s2= Matrix(n, n, sfix)
+        s1.assign_all(0)
+        s2.assign_all(0)
+        D_inv = Array(n, sfix)
+
+        sec_L_recording = Matrix(n, n, cint)
+        sec_L_recording.assign_all(1)
+        sec_L_recording.set_column(0, sec_QP_A_recording_hat.get_column(0))
+        print_ln('==== init sec_L_recording:\n%s\n', sec_L_recording.reveal())
+
+        for j in range(n):
+            print_ln('\n====== func in ldl_compose() loop :%s', j)
+            # 计算D[j]
+            library.start_timer(2)
+            @for_range_multithread(12, 1, j)
+            def f1(k):
+                # print_ln('[Thread-%s] compute s1[j=%s][k=%s]:', library.get_thread_number(), j, k)
+                Multi_table[j][k] = L[j][k] * D[k]
+            s1[j] += L[j][:j].dot(Multi_table[j][:j])
+            library.stop_timer(2)
+            D[j] = a[j][j] - s1[j]
+
+            # 计算L[i][j] (i > j)
+            D_inv[j] = sfix(1) / D[j]
+
+            library.start_timer(3)
+            @for_range_multithread(12, 1, n-j-1)
+            def compute_l_parallel(i):
+                i = i + j + 1
+                print_ln('[Thread-%s] compute_l_parallel(j=%s, i=%s):', library.get_thread_number(), j, i)
+                is_sum_multi_item_not_zero = cint.Matrix(1,1).assign_all(0)
+
+                @for_range(j)
+                def compute_multi_items(k):
+                    # print_ln('[Thread-%s]   compute_multi_items(k=%s): s_param[i=%s][k=%s]', library.get_thread_number(), k, i, k)
+                    @if_(sec_L_recording[i][k] + sec_L_recording[j][k] == 2)
+                    def f2():
+                        is_sum_multi_item_not_zero[0][0] = cint(1)
+
+
+                Flag = is_sum_multi_item_not_zero[0][0] + sec_QP_A_recording_hat[i][j]
+                @if_e(Flag == 0)
+                def f3():
+                    L[i][j] = sfix(0)
+                    sec_L_recording[i][j] = cint(0)
+                    print_ln('[Thread-%s]  before run L[i=%s][j=%s] find flag=0: break', library.get_thread_number(), i, j)
+                @else_
+                def f3():
+                    print_ln('[Thread-%s]   s2[j=%s][i=%s] = L[i=%s][:].dot(M_t[j=%s][:])', library.get_thread_number(), j, i, i, j)
+                    s2[j][i] = L[i][:].dot(Multi_table[j][:])  # use dot() instead of multi_items[i][k]
+                    L[i][j] = (a[i][j] - s2[j][i]) * D_inv[j]
+                # print_ln('[Thread-%s] ', library.get_thread_number())
+            library.stop_timer(3)
+            # print_ln('==== In loop D[j=%s]=%s', j, D[j].reveal())
+            # print_ln('==== In loop j=%s - L=%s', j, L.get_column(j).reveal())
+
+        print_ln('==== after sec_L_recording:\n%s\n', sec_L_recording.reveal())
+        return D, L, D_inv
+
+    sec_D, sec_L, sec_D_inv = ldl_compose(sec_A_hat)
+
+    # ======= ldl test =======
+    # AA = Matrix(4,4, sfix)
+    # for i in range(4):
+    #     for j in range(4):
+    #         AA[i][j] = sfix.get_input_from(0)
+    # PP = Matrix(4, 4, cint)
+    # PP.assign_all(0)
+    # PP[0][2] = cint(1)
+    # PP[1][1] = cint(1)
+    # PP[2][3] = cint(1)
+    # PP[3][0] = cint(1)
+    #
+    # print_ln('==== AA:\n%s\n', AA.reveal())
+    # print_ln('==== PP:\n%s\n', PP.reveal())
+    #
+    # AA_hat = permutation(PP, AA, isFrontMuilt=True)
+    # AA_hat = permutation(PP.transpose(), AA_hat, isFrontMuilt=False)
+    #
+    # print_ln('==== AA_hat:\n%s\n', AA_hat.reveal())
+    #
+    # sec_D, sec_L, sec_D_inv = ldl_compose(AA_hat)
+    # ======== end ldl test =====
+
+    clear_D = sec_D.reveal()
+    clear_L = sec_L.reveal()
+
+    print_ln('==== clear_L:\n%s\n', clear_L)
+    print_ln('==== clear_D:\n%s\n', clear_D)
+    print_ln('==== clear_D_inv:\n%s\n', sec_D_inv.reveal())
+
+    # ==================== 解方程  ====================
+
+    def solve_with_LD(sec_QP_b, sec_L, sec_D, sec_D_inv):
+        n = sec_QP_b.shape[0]
+        X = Matrix(n, 1, sfix)
+        y = Matrix(n, 1, sfix)
+        s1 = Array(n, sfix)
+        s2 = Array(n, sfix)
+        s1.assign_all(0)
+        s2.assign_all(0)
+
+        for i in range(0, n):
+            # library.start_timer(4000+i)
+            # @for_range_opt(i)  ## comment since use dot
+            # def f1(k):
+            #     s1[i] += sec_L[i][k] * y[k]
+            print(f'y is {i}')
+            s1[i] = sec_L[i][:].dot(y[:])
+            y[i] = sec_QP_b[i] - s1[i]
+            # library.stop_timer(4000+i)
+
+        # X[n-1] = y[n-1] * sec_D_inv[n-1]
+        for i in range(n-1, -1, -1):
+            # library.start_timer(5000+i)
+            # @for_range_opt(i+1, n, 1)   ## comment since use dot
+            # def f2(k):
+            #     s2[i] += sec_L[k][i] * X[k]
+            s2[i] = sec_L.get_column(i).dot(X[:])
+            X[i] = y[i] * sec_D_inv[i] - s2[i]
+            # library.stop_timer(5000+i)
+
+        return X
+
+    # ========= solve test ==========
+    # bb = Matrix(4, 1, sfix)
+    # for i in range(4):
+    #     bb[i] = sfix.get_input_from(0)
+    # bb1 = permutation(PP, bb, isFrontMuilt=True)
+    # print_ln('==== bb1:\n%s\n', bb1.reveal())
+    # X = solve_with_LD(bb1, sec_L, sec_D, sec_D_inv)
+    # X = permutation(PP.transpose(), X, isFrontMuilt=True)
+    # ========= end solve test ========
+
+    sec_QP_bb = permutation(clear_P, sec_QP_b, isFrontMuilt=True)
+    print_ln('==== sec_QP_bb\n%s\n', sec_QP_bb.reveal())
+
+    X = solve_with_LD(sec_QP_bb, sec_L, sec_D, sec_D_inv)
+    X = permutation(clear_P.transpose(), X, isFrontMuilt=True)
+    print_ln('==== X:\n%s\n', X.reveal())
+
+
+
+if __name__ == "__main__":
+    compiler.compile_func()

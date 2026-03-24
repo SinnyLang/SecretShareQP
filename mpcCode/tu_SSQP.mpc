@@ -1,0 +1,187 @@
+import scipy
+from Compiler.compilerLib import Compiler
+from Compiler.library import print_ln, for_range_opt, get_player_id, if_
+from Compiler.types import Matrix, sint, sfix, cint, Array, regint
+
+usage = "usage: %prog [options] [args]"
+compiler = Compiler(usage=usage)
+
+
+def read_A_b_P_from_mat(file_path1: str, file_path2: str):
+    """从mat读取矩阵"""
+    # 加载 MATLAB 数据
+    data1 = scipy.io.loadmat(file_path1)
+    A, b = data1['A2'], data1['full_bs']
+    data2 = scipy.io.loadmat(file_path2)
+    P = data2['P2']
+    return A, b, P
+
+
+def write_x_to_mat(file_path: str, x):
+    """将矩阵写入mat"""
+    # 保存回 MATLAB 格式
+    scipy.io.savemat('file_path', {'full_x': x})
+
+@compiler.register_function('ssQP')
+def main():
+    sfix.set_precision(f=40)
+    QP_A, b, P = read_A_b_P_from_mat(
+        'Player-Data/temp_data_A_b.mat',
+        'Player-Data/temp_data_P.mat'
+    )
+
+    ### 分离二次项 Q = diag(H1,H2,H3,mu)
+    H1, H2, H3 = QP_A[0:20, 0:20], QP_A[20:36, 20:36], QP_A[36:52, 36:52]
+    mu = QP_A[52:68, 52:68]
+
+    ### 分离约束项 [A1,A2,A3,-E; J1,0,0,0; 0,J2,0,0; 0,0,J3,0]
+    idx = H1.shape[0] + H2.shape[0] + H3.shape[0] + mu.shape[0]  # 68
+    A1, A2, A3 = QP_A[idx + 0:idx + 16, 0:20], QP_A[idx + 0:idx + 16, 20:36], QP_A[idx + 0:idx + 16, 36:52]
+    J1, J2, J3 = (QP_A[idx + 16:idx + 16 + 12, 0:20], QP_A[idx + 16 + 12:idx + 16 + 12 + 10, 20:36],
+                  QP_A[idx + 16 + 12 + 10:idx + 16 + 12 + 10 + 8, 36:52])
+
+    ### 分离b向量 [g1,g2,g3,lambda,rhs,0,0,0]
+    g1, g2, g3 = b[0:20, :], b[20:36, :], b[36:52, :]
+    lambda_global = b[52:68, :]
+    rhs = b[68:84]
+
+    # ==================== 数据准备阶段 ====================
+    # 各方私有数据维度配置
+    n_x, n_y, n_z = 20, 16, 16  # 状态变量维度
+    m_A = 16  # 共享约束维度
+    m_Jx, m_Jy, m_Jz = 12, 10, 8  # 各自私有约束维度
+
+    # 输入Q1矩阵
+    row = column = n_x+n_y+n_z+m_A + m_A+m_Jx+m_Jy+m_Jz
+    sec_QP_A = Matrix(row, column, sfix)
+    sec_QP_A.assign_all(0)
+
+    for i in range(n_x):
+        for j in range(n_x):
+            sec_QP_A[i][j] = sfix(H1[i,j])
+    offset = n_x
+    for i in range(n_y):
+        for j in range(n_y):
+            sec_QP_A[i+offset][j+offset] = sfix(H2[i,j])
+    offset += n_y
+    for i in range(n_z):
+        for j in range(n_z):
+            sec_QP_A[i+offset][j+offset] = sfix(H3[i,j])
+    offset += n_z
+    for i in range(m_A):
+        for j in range(m_A):
+            sec_QP_A[i+offset][j+offset] = sfix(mu[i,j])
+
+    offset_r = offset+m_A
+    offset_c = 0
+    for i in range(m_A):
+        for j in range(n_x):
+            sec_QP_A[i + offset_r][j + offset_c] = sfix(A1[i,j])
+            sec_QP_A[j + offset_c][i + offset_r] = sfix(A1[i,j])
+    offset_c += n_x
+    for i in range(m_A):
+        for j in range(n_y):
+            sec_QP_A[i + offset_r][j + offset_c] = sfix(A2[i,j])
+            sec_QP_A[j + offset_c][i + offset_r] = sfix(A2[i,j])
+    offset_c += n_y
+    for i in range(m_A):
+        for j in range(n_z):
+            sec_QP_A[i + offset_r][j + offset_c] = sfix(A3[i,j])
+            sec_QP_A[j + offset_c][i + offset_r] = sfix(A3[i,j])
+    offset_c += n_z
+    for i in range(m_A):
+        sec_QP_A[i + offset_r][i + offset_c] = sfix(-1)
+        sec_QP_A[i + offset_c][i + offset_r] = sfix(-1)
+
+    offset_r += m_A
+    offset_c = 0
+    for i in range(m_Jx):
+        for j in range(n_x):
+            sec_QP_A[i + offset_r][j + offset_c] = sfix(J1[i,j])
+            sec_QP_A[j + offset_c][i + offset_r] = sfix(J1[i,j])
+    offset_r += m_Jx
+    offset_c += n_x
+    for i in range(m_Jy):
+        for j in range(n_y):
+            sec_QP_A[i + offset_r][j + offset_c] = sfix(J2[i,j])
+            sec_QP_A[j + offset_c][i + offset_r] = sfix(J2[i,j])
+    offset_r += m_Jy
+    offset_c += n_y
+    for i in range(m_Jz):
+        for j in range(n_z):
+            sec_QP_A[i + offset_r][j + offset_c] = sfix(J3[i,j])
+            sec_QP_A[j + offset_c][i + offset_r] = sfix(J3[i,j])
+
+    # 构建 Q2
+    # b向量[g1, g2, g3, lambda , rhs, 0, 0, 0]
+    row = n_x+n_y+n_z+m_A + m_A+m_Jx+m_Jy+m_Jz
+    sec_QP_b = Matrix(row, 1, sfix)
+    for i in range(n_x):
+        sec_QP_b[i][0] = sfix(g1[i,0])
+    for i in range(n_y):
+        sec_QP_b[i][0] = sfix(g2[i,0])
+    for i in range(n_z):
+        sec_QP_b[i][0] = sfix(g3[i,0])
+    for i in range(m_A):
+        sec_QP_b[i][0] = sfix(lambda_global[i,0])
+    for i in range(m_A):
+        sec_QP_b[i][0] = sfix(rhs[i,0])
+    for i in range(m_Jx+m_Jy+m_Jz):
+        sec_QP_b[i][0] = sfix(0)
+
+    clear_P = cint.Matrix(P.shape[0], P.shape[1])
+
+    sec_A_hat = clear_P.dot(sec_QP_A)
+    sec_A_hat = sec_A_hat.dot(clear_P.transpose())
+
+    #=================== 计算 ======================
+
+    def ldl_compose(a):
+        n = a.shape[0]
+
+        L = Matrix(n, n, sfix)
+        D = Array(n, sfix)
+        s1= Array(n, sfix)
+        s2= Matrix(n, n, sfix)
+        s1.assign_all(0)
+        s2.assign_all(0)
+
+        D_inv = Array(n, sfix)
+
+        for j in range(n):
+            # 计算D[j]
+            @for_range_opt(j)
+            def f1(k):
+                s1[j] += L[j][k] ** 2 * D[k]
+            D[j] = a[j][j] - s1[j]
+
+            # 计算L[i][j] (i > j)
+            D_inv[j] = sfix(1) / D[j]
+            @for_range_opt(j+1, n, 1)
+            def compute_L(i):
+                @for_range_opt(j)
+                def f2(k):
+                    s2[j][i] += L[i][k] * L[j][k] * D[k]
+                L[i][j] = (a[i][j] - s2[j][i]) * D_inv[j]
+
+        return D, L, D_inv
+
+    sec_D, sec_L, sec_D_inv = ldl_compose(sec_A_hat)
+
+    clear_D = sec_D.reveal()
+    clear_L = sec_L.reveal()
+
+    f = open("output-L.csv", "w")
+    for i in range(clear_L.shape[0]):
+        line = ",".join(str(clear_L[i][j]) for j in range(clear_L.shape[1]))
+        f.write(line + "\n")
+    f.close()
+    f = open("output-D.txt", "w")
+    line = ",".join(str(clear_D[j]) for j in range(clear_D.shape[0]))
+    f.write(line)
+    f.close()
+
+
+
+if __name__ == "__main__":
+    compiler.compile_func()
